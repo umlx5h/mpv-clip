@@ -26,25 +26,33 @@ local o = {
 	-- Key bindings
 	key_set_start_frame = "c",
 	key_set_stop_frame = "C",
-	key_start_encode = "ctrl+C",
+	key_start_lossless = "ctrl+C",
+	key_start_encode = "ctrl+E",
+	key_start_gif = "ctrl+G",
 
 	-- Audio settings
 	audio_codec = "libopus",
 	audio_bitrate = "192k",
 
-	-- Video settings
+	-- Video settings (encode)
 	video_codec = "libx265",
-	video_crf = "24",
+	video_crf = "25",
 	video_pixel_format = "yuv420p10",
 	video_width = "", -- source width if not specified
 	video_height= "", -- source height if not specified
 	video_upscale = false, -- upscale if video res is lower than desired res
+	video_container = "mkv",
+
+	-- Video settings (gif)
+	gif_fps = "14",
+	gif_scale = "480x270",
+	gif_optimize = true,
 
 	-- Misc settings
 	encoding_preset = "medium", -- empty for no preset
-	output_directory = "/tmp",
-	clear_start_stop_on_encode = true,
-	block_exit = false, -- stop mpv from quitting before the encode finished, if false…
+	output_directory = "clip",
+	clear_start_stop_on_encode = false,
+	block_exit = true, -- stop mpv from quitting before the encode finished, if false…
 		-- …mpv will quit but ffmpeg will be kept alive
 }
 options.read_options(o)
@@ -52,9 +60,10 @@ options.read_options(o)
 -- Global mutable variables
 local start_frame = nil
 local stop_frame = nil
+local clip_type = 0 -- 0->lossless, 1->x265, 2->gif
 
 function encode()
-	if not start_frame then 
+	if not start_frame then
 		mp.osd_message("No start frame set!")
 		return
 	end
@@ -67,9 +76,13 @@ function encode()
 	end
 
 	local path = mp.get_property("path")
-	local out = o.output_directory.."/"..mp.get_property("media-title").."-clip-"..start_frame..
-		"-"..stop_frame..".mkv"
-	
+	local filename = mp.get_property("filename")
+	local fileExt = filename:match("^.+%.(.+)$")
+
+	local currentDir = string.sub(path, 1, string.len(path)-string.len(filename))
+
+	local out = currentDir..o.output_directory.."/"..mp.get_property("media-title").."-clip-"..start_frame..
+		"-"..stop_frame
 	local width = mp.get_property("width")
 	local height = mp.get_property("height")
 	if o.video_width ~= "" and (o.video_width < width or o.video_upscale) then
@@ -94,22 +107,62 @@ function encode()
 	-- Check if ytdl is needed
 	local input
 	if not os.execute('ffprobe "'..path..'"') then
-		input = 'youtube-dl "'..path..'" -o - | ffmpeg -i -'
+		input = '/usr/local/bin/youtube-dl "'..path..'" -o - | ffmpeg -ss '..saf..' -i -'
 	else
-		input = 'ffmpeg -i "'..path..'"'
+		if clip_type == 2 then
+			input = '/usr/local/bin/ffmpeg -ss '..saf..' -t '..sof-saf..' -i "'..path..'"'
+		else
+			input = '/usr/local/bin/ffmpeg -ss '..saf..' -i "'..path..'"'
+		end
 	end
 
 	-- FIXME: Map metadata properly, like chapters or embedded fonts
-	local command = input.." -ss "..saf.." -t "..sof-saf..
-		" -c:a "..o.audio_codec.." -b:a "..o.audio_bitrate.." -c:v "..o.video_codec..
-		" -pix_fmt "..o.video_pixel_format.." -crf "..o.video_crf.." -s "..width.."x"..
-		height.." "..preset..' "'..out..'"'
+	local command = input
+	local precommand = input
+	--local endcommand = "/usr/local/bin/imageoptim \""..out..".gif\""
+	--local endcommand = "/usr/local/bin/imageoptim "..'"'..out..".gif"..'"'
+	--local endcommand = "/usr/local/bin/imageoptim '"..currentDir..o.output_directory.."/*.gif'" -- all gif image
+	--local endcommand = "/usr/local/bin/gifsicle -O2 -o "..'"'..out..'" "'..out..'"'
+
+	if clip_type == 0 then
+		command = command.." -t "..sof-saf.." -c:v copy -c:a copy"..' "'..out.."."..fileExt..'"'
+
+	elseif clip_type == 1 then
+		command = command.." -t "..sof-saf.." -c:a "..o.audio_codec.." -b:a "..o.audio_bitrate.." -c:v "..o.video_codec..
+			" -pix_fmt "..o.video_pixel_format.." -crf "..o.video_crf.." -s "..width.."x"..
+			height.." "..preset..' "'..out.."."..o.video_container..'"'
+
+	elseif clip_type == 2 then
+		local baseOpt = "fps="..o.gif_fps..",scale="..o.gif_scale
+		precommand = command.." -vf \""..baseOpt..":flags=lanczos,palettegen\" -y /tmp/palette.png"
+		command = command.." -i /tmp/palette.png -lavfi \""..baseOpt..":flags=lanczos [x]; [x][1:v] paletteuse\""..' "'..out..".gif"..'"'
+		--os.execute("echo "..precommand.." | pbcopy")
+		--os.execute("echo "..command.." | pbcopy")
+		--os.execute("echo "..endcommand.." | pbcopy")
+	end
+
 	local time = os.time()
 
-	mp.osd_message("Starting encode from "..saf.." to "..sof.." into "..out, 3.5)
+	startMsg = "Starting encode from "..saf.." to "..sof
+	os.execute("osascript -e 'display notification \""..startMsg.."\" with title \"mpv\"'")
+	mp.osd_message(startMsg, 3.5)
+
 	if o.block_exit then
-		os.execute(command)
-		mp.osd_message("Finished encode of "..out.." in "..os.time()-time.." seconds", 3.5)
+		--endMsg = "in $(expr \\( `date +%s` \\) - "..time..") seconds"
+		if clip_type == 2 then
+			os.execute(precommand)
+			os.execute(command)
+			--os.execute(endcommand)
+			os.execute("osascript -e 'display notification \"End\" with title \"mpv\" sound name \"glass\"'")
+		else
+			os.execute(command.." && osascript -e 'display notification \"End\" with title \"mpv\" sound name \"glass\"'")
+		end
+
+		--os.execute(command)
+		--mp.osd_message("Finished encode of "..out.." in "..os.time()-time.." seconds", 3.5)
+		--endMsg = "Finished encode from "..saf.." to "..sof.." in "..os.time()-time.." seconds"
+		--os.execute("osascript -e 'display notification \""..endMsg.."\" with title \"mpv\" sound name \"glass\"'")
+		--mp.osd_message(endMsg, 3.5)
 	else
 		-- FIXME: Won't work on Windows, because of special snowflake pipe naming
 		local ipc = mp.get_property("input-ipc-server")
@@ -145,9 +198,22 @@ mp.add_key_binding(o.key_set_stop_frame, "clip-end",
 		end
 	end)
 -- Start encode key binding
+mp.add_key_binding(o.key_start_lossless, "clip-lossless",
+	function()
+		clip_type = 0
+		encode()
+	end)
+
 mp.add_key_binding(o.key_start_encode, "clip-encode",
 	function()
-		encode()	
+		clip_type = 1
+		encode()
+	end)
+
+mp.add_key_binding(o.key_start_gif, "clip-gif",
+	function()
+		clip_type = 2
+		encode()
 	end)
 
 -- Reset start/stop frame when a new file is loaded
